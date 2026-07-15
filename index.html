@@ -164,8 +164,10 @@ main{margin-left:312px;flex:1;background:
 <div class="overlay" id="overlay"></div>
 
 <div class="tts-player" id="ttsPlayer">
-  <span class="lbl">🔊 กำลังอ่าน</span>
+  <span class="lbl">🔊 <span id="ttsPos">กำลังอ่าน</span></span>
+  <button id="ttsBack" class="ghost" title="ย้อนท่อน">⏮</button>
   <button id="ttsToggle" class="ghost" title="เล่น/หยุดชั่วคราว">⏸</button>
+  <button id="ttsFwd" class="ghost" title="ท่อนถัดไป">⏭</button>
   <button id="ttsStop" title="หยุด">⏹</button>
 </div>
 
@@ -213,47 +215,186 @@ DATA.toc.forEach(part=>{
   });
 });
 
-// ---------- Text-to-Speech (Web Speech API) ----------
-let ttsEls = [], ttsIdx = 0, ttsActive = false;
+// ---------- Text-to-Speech (v2: auto-next chapter, resume, keep-alive) ----------
+let ttsChunks=[], ttsIdx=0, ttsActive=false, ttsPaused=false;
+let ttsKeepAlive=null, ttsWakeLock=null, ttsCurUtter=null, ttsAutoAdvance=false;
 const synth = window.speechSynthesis || null;
+const TTS_POS = "m315_tts_pos";
+
 function pickThaiVoice(){
   if(!synth) return null;
   const vs = synth.getVoices();
   return vs.find(v=>/^th/i.test(v.lang)) || vs.find(v=>/thai/i.test(v.name)) || null;
 }
 if(synth){ synth.onvoiceschanged = ()=>{}; }
-function clearHighlight(){
-  document.querySelectorAll(".body .speaking").forEach(e=>e.classList.remove("speaking"));
-}
+function clearHighlight(){ document.querySelectorAll(".body .speaking").forEach(e=>e.classList.remove("speaking")); }
 function showPlayer(show){ document.getElementById("ttsPlayer").classList.toggle("show", show); }
-function stopTTS(){
-  if(synth) synth.cancel();
-  ttsActive=false; ttsIdx=0; clearHighlight(); showPlayer(false);
-  const t=document.getElementById("ttsToggle"); if(t) t.textContent="⏸";
+function setToggleIcon(playing){ const t=document.getElementById("ttsToggle"); if(t) t.textContent = playing?"⏸":"▶"; }
+
+// ---- keep screen awake while reading (มือถือส่วนใหญ่หยุดเสียงเมื่อจอดับ) ----
+async function requestWakeLock(){
+  try{
+    if("wakeLock" in navigator){
+      ttsWakeLock = await navigator.wakeLock.request("screen");
+      ttsWakeLock.addEventListener("release", ()=>{ ttsWakeLock=null; });
+    }
+  }catch(e){ /* ไม่รองรับ = ข้ามไป */ }
 }
+function releaseWakeLock(){ try{ ttsWakeLock && ttsWakeLock.release(); }catch(e){} ttsWakeLock=null; }
+
+// ---- Chrome หยุดพูดเองราว 15 วิ ในข้อความยาว -> pause/resume กันตาย ----
+function startKeepAlive(){
+  stopKeepAlive();
+  ttsKeepAlive = setInterval(()=>{
+    if(!synth || !ttsActive || ttsPaused) return;
+    if(synth.speaking){ synth.pause(); synth.resume(); }
+  }, 10000);
+}
+function stopKeepAlive(){ if(ttsKeepAlive){ clearInterval(ttsKeepAlive); ttsKeepAlive=null; } }
+
+// ---- ซอยย่อหน้ายาวเป็นท่อนสั้น: กันเสียงขาด + resume แม่นขึ้น ----
+function splitToChunks(text, max){
+  max = max || 180;
+  const out=[];
+  const parts = text.split(/(?<=[\.\!\?\u0E2F])\s+|(?<=\s)(?=\u0020{2,})/).filter(Boolean);
+  let buf="";
+  const push=s=>{ s=s.trim(); if(s) out.push(s); };
+  const flow = parts.length>1 ? parts : [text];
+  flow.forEach(seg=>{
+    if((buf+" "+seg).trim().length<=max){ buf=(buf?buf+" ":"")+seg; return; }
+    push(buf); buf="";
+    if(seg.length<=max){ buf=seg; return; }
+    let s=seg;
+    while(s.length>max){
+      let cut=s.lastIndexOf(" ",max); if(cut<max*0.5) cut=max;
+      push(s.slice(0,cut)); s=s.slice(cut).trim();
+    }
+    buf=s;
+  });
+  push(buf);
+  return out.length?out:[text];
+}
+function buildChunks(){
+  const els = Array.from(document.querySelectorAll(".body > p, .body > h2, .body > .q"));
+  ttsChunks = [];
+  els.forEach(el=>{
+    const t=(el.textContent||"").trim();
+    if(!t) return;
+    splitToChunks(t).forEach(txt=> ttsChunks.push({el, txt}));
+  });
+}
+
+// ---- จำตำแหน่ง: เล่นต่อจากที่ค้างไว้ ----
+function savePos(){
+  try{ localStorage.setItem(TTS_POS, JSON.stringify({ch:current, i:ttsIdx})); }catch(e){}
+}
+function loadPos(){
+  try{ return JSON.parse(localStorage.getItem(TTS_POS)||"null"); }catch(e){ return null; }
+}
+
 function speakNext(){
-  if(!ttsActive || ttsIdx>=ttsEls.length){ stopTTS(); return; }
-  const el = ttsEls[ttsIdx];
-  const u = new SpeechSynthesisUtterance(el.textContent);
-  u.lang = "th-TH";
-  const v = pickThaiVoice(); if(v) u.voice = v;
-  u.rate = 0.98; u.pitch = 1.0;
-  u.onstart = ()=>{ clearHighlight(); el.classList.add("speaking");
-    el.scrollIntoView({block:"center", behavior:"smooth"}); };
-  u.onend = ()=>{ ttsIdx++; speakNext(); };
-  u.onerror = ()=>{ ttsIdx++; speakNext(); };
+  if(!ttsActive) return;
+  if(ttsIdx >= ttsChunks.length){ nextChapterOrStop(); return; }
+  const {el, txt} = ttsChunks[ttsIdx];
+  const u = new SpeechSynthesisUtterance(txt);
+  u.lang="th-TH";
+  const v=pickThaiVoice(); if(v) u.voice=v;
+  u.rate=0.98; u.pitch=1.0;
+  u.onstart = ()=>{
+    const p=document.getElementById("ttsPos");
+    if(p) p.textContent = `กำลังอ่าน ${ttsIdx+1}/${ttsChunks.length}`;
+    clearHighlight(); el.classList.add("speaking");
+    el.scrollIntoView({block:"center", behavior:"smooth"});
+    savePos();
+  };
+  u.onend = ()=>{ if(!ttsActive||ttsPaused) return; ttsIdx++; savePos(); speakNext(); };
+  u.onerror = ()=>{ if(!ttsActive||ttsPaused) return; ttsIdx++; speakNext(); };
+  ttsCurUtter = u;
   synth.speak(u);
 }
-function startTTS(){
-  if(!synth){ alert("อุปกรณ์นี้ไม่รองรับการอ่านออกเสียงในเบราว์เซอร์ ลองใช้ Chrome หรือ Safari รุ่นใหม่"); return; }
-  synth.cancel();
-  ttsEls = Array.from(document.querySelectorAll(".body > p, .body > h2, .body > .q"));
-  if(!ttsEls.length) return;
-  ttsIdx = 0; ttsActive = true;
-  showPlayer(true);
-  document.getElementById("ttsToggle").textContent="⏸";
+
+// ---- จบบท -> ไปบทถัดไปอัตโนมัติ ----
+function nextChapterOrStop(){
+  const idx = flat.findIndex(f=>f.num===current);
+  const nx  = flat[idx+1];
+  if(nx && nx.ready){
+    ttsAutoAdvance = true;            // กัน render() สั่ง stopTTS
+    go(nx.num);                       // เปลี่ยนบท
+    ttsAutoAdvance = false;
+    setTimeout(()=>{
+      if(!ttsActive) return;
+      buildChunks(); ttsIdx=0; savePos();
+      setupMediaSession();            // อัปเดตชื่อบทบนหน้าจอล็อก
+      speakNext();                    // อ่านต่อทันที
+    }, 450);
+  } else {
+    stopTTS(true);                    // จบเล่ม
+  }
+}
+
+function stopTTS(finished){
+  if(synth) synth.cancel();
+  ttsActive=false; ttsPaused=false; ttsCurUtter=null;
+  stopKeepAlive(); releaseWakeLock();
+  clearHighlight(); showPlayer(false); setToggleIcon(false);
+  if(finished){ try{ localStorage.removeItem(TTS_POS); }catch(e){} }
+}
+
+function setupMediaSession(){
+  if(!("mediaSession" in navigator)) return;
+  try{
+    const meta = flat.find(f=>f.num===current) || {};
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: (current>=1? "บทที่ "+current+" · " : "") + (meta.title||"วิ่ง"),
+      artist: "วิ่ง · Tik14",
+      album: meta.part || "ศาสตร์ ศิลป์ และการเดินทางของนักวิ่ง",
+    });
+    navigator.mediaSession.playbackState = ttsPaused ? "paused" : "playing";
+    const tog=()=>document.getElementById("ttsToggle").onclick();
+    navigator.mediaSession.setActionHandler("play",  ()=>{ if(ttsPaused) tog(); });
+    navigator.mediaSession.setActionHandler("pause", ()=>{ if(!ttsPaused) tog(); });
+    navigator.mediaSession.setActionHandler("stop",  ()=>stopTTS(true));
+    navigator.mediaSession.setActionHandler("previoustrack", ()=>ttsSeek(-1));
+    navigator.mediaSession.setActionHandler("nexttrack",     ()=>ttsSeek(1));
+  }catch(e){}
+}
+// ข้ามท่อน (ย้อน/ถัดไป)
+function ttsSeek(d){
+  if(!ttsActive) return;
+  ttsIdx = Math.max(0, Math.min(ttsChunks.length-1, ttsIdx + d));
+  savePos(); synth.cancel();
+  ttsPaused=false; setToggleIcon(true);
   speakNext();
 }
+function startTTS(fromSaved){
+  if(!synth){ alert("อุปกรณ์นี้ไม่รองรับการอ่านออกเสียงในเบราว์เซอร์ ลองใช้ Chrome หรือ Safari รุ่นใหม่"); return; }
+  synth.cancel();
+  buildChunks();
+  if(!ttsChunks.length) return;
+  let start=0;
+  if(fromSaved){
+    const p=loadPos();
+    if(p && p.ch===current && p.i<ttsChunks.length) start=p.i;
+  }
+  ttsIdx=start; ttsActive=true; ttsPaused=false;
+  showPlayer(true); setToggleIcon(true);
+  requestWakeLock(); startKeepAlive(); setupMediaSession();
+  speakNext();
+}
+
+// ---- จอดับ/สลับแท็บ: กลับมาแล้วเล่นต่อจากจุดเดิม ----
+document.addEventListener("visibilitychange", ()=>{
+  if(!ttsActive) return;
+  if(document.hidden){
+    savePos();
+  } else {
+    if(ttsWakeLock===null) requestWakeLock();
+    if(!ttsPaused && synth && !synth.speaking){
+      synth.cancel();
+      speakNext();   // เบราว์เซอร์ตัดเสียงตอนพับจอ -> อ่านต่อจากท่อนเดิม
+    }
+  }
+});
 
 function showCover(){
   stopTTS();
@@ -288,8 +429,10 @@ function showCover(){
   try{localStorage.setItem("ebook_last","cover")}catch(e){}
 }
 
+let current = null;   // บทที่กำลังเปิดอยู่ (TTS ใช้อ้างอิง)
 function render(num){
-  stopTTS();
+  if(!ttsAutoAdvance) stopTTS();   // auto-next: ห้าม stop ระหว่างเปลี่ยนบท
+  current = num;
   const meta = flat.find(f=>f.num===num);
   const reader = document.getElementById("reader");
   const blocks = DATA.content[key(num)];
@@ -298,7 +441,7 @@ function render(num){
   const hasContent = !!blocks;
   inner += `<h1 class="ch-title">${t}</h1><div class="rule"></div>`;
   if(hasContent){
-    inner += `<button class="listen-btn" onclick="startTTS()"><span class="ic">🔊</span> ฟังเสียงอ่าน</button>`;
+    inner += `<button class="listen-btn" onclick="startTTS(true)"><span class="ic">🔊</span> ฟังเสียงอ่าน</button>`;
   }
   inner += `<div class="body">`;
   if(blocks){
@@ -347,11 +490,24 @@ document.getElementById("fdown").onclick=()=>{fs=Math.max(15,fs-1);applyFs()};
 // TTS player controls
 document.getElementById("ttsToggle").onclick = ()=>{
   if(!synth) return;
-  const btn=document.getElementById("ttsToggle");
-  if(synth.paused){ synth.resume(); btn.textContent="⏸"; }
-  else if(synth.speaking){ synth.pause(); btn.textContent="▶"; }
+  if(!ttsActive){ startTTS(true); return; }          // เล่นต่อจากที่ค้าง
+  if(ttsPaused){                                      // ▶ กดเล่นต่อ
+    ttsPaused=false; setToggleIcon(true);
+    if("mediaSession" in navigator) navigator.mediaSession.playbackState="playing";
+    requestWakeLock(); startKeepAlive();
+    if(synth.paused && synth.speaking){ synth.resume(); }
+    else { synth.cancel(); speakNext(); }             // resume ไม่ติด -> อ่านท่อนเดิมใหม่
+  } else {                                            // ⏸ หยุดชั่วคราว
+    ttsPaused=true; setToggleIcon(false);
+    if("mediaSession" in navigator) navigator.mediaSession.playbackState="paused";
+    stopKeepAlive(); releaseWakeLock();
+    savePos();
+    try{ synth.pause(); }catch(e){ synth.cancel(); }
+  }
 };
-document.getElementById("ttsStop").onclick = stopTTS;
+document.getElementById("ttsStop").onclick = ()=>stopTTS(true);
+document.getElementById("ttsBack").onclick = ()=>ttsSeek(-1);
+document.getElementById("ttsFwd").onclick  = ()=>ttsSeek(1);
 window.addEventListener("beforeunload", ()=>{ if(synth) synth.cancel(); });
 
 // sidebar mobile
