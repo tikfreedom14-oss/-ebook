@@ -221,12 +221,15 @@ let ttsKeepAlive=null, ttsWakeLock=null, ttsCurUtter=null, ttsAutoAdvance=false;
 const synth = window.speechSynthesis || null;
 const TTS_POS = "m315_tts_pos";
 
+let cachedVoice=null;
 function pickThaiVoice(){
   if(!synth) return null;
-  const vs = synth.getVoices();
-  return vs.find(v=>/^th/i.test(v.lang)) || vs.find(v=>/thai/i.test(v.name)) || null;
+  if(cachedVoice) return cachedVoice;
+  const vs = synth.getVoices()||[];
+  cachedVoice = vs.find(v=>/^th/i.test(v.lang)) || vs.find(v=>/thai/i.test(v.name)) || null;
+  return cachedVoice;
 }
-if(synth){ synth.onvoiceschanged = ()=>{}; }
+if(synth){ synth.onvoiceschanged = ()=>{ cachedVoice=null; pickThaiVoice(); }; }
 function clearHighlight(){ document.querySelectorAll(".body .speaking").forEach(e=>e.classList.remove("speaking")); }
 function showPlayer(show){ document.getElementById("ttsPlayer").classList.toggle("show", show); }
 function setToggleIcon(playing){ const t=document.getElementById("ttsToggle"); if(t) t.textContent = playing?"⏸":"▶"; }
@@ -242,36 +245,33 @@ async function requestWakeLock(){
 }
 function releaseWakeLock(){ try{ ttsWakeLock && ttsWakeLock.release(); }catch(e){} ttsWakeLock=null; }
 
-// ---- Chrome หยุดพูดเองราว 15 วิ ในข้อความยาว -> pause/resume กันตาย ----
+// ---- Chrome "เดสก์ท็อป" หยุดพูดเองราว 15 วิ -> pause/resume กันตาย
+// สำคัญ: ห้ามใช้บนมือถือ! (Android/iOS จะทำให้เสียงสะดุดเป็นจังหวะ)
+const IS_MOBILE = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent||"");
+const NEED_KEEPALIVE = !IS_MOBILE && /Chrome\//.test(navigator.userAgent||"") && !/Edg\//.test(navigator.userAgent||"");
 function startKeepAlive(){
   stopKeepAlive();
+  if(!NEED_KEEPALIVE) return;              // มือถือ: ไม่ต้องใช้ (ท่อนสั้นพอแล้ว)
   ttsKeepAlive = setInterval(()=>{
     if(!synth || !ttsActive || ttsPaused) return;
-    if(synth.speaking){ synth.pause(); synth.resume(); }
-  }, 10000);
+    if(synth.speaking && !synth.paused){ synth.pause(); synth.resume(); }
+  }, 12000);
 }
 function stopKeepAlive(){ if(ttsKeepAlive){ clearInterval(ttsKeepAlive); ttsKeepAlive=null; } }
 
 // ---- ซอยย่อหน้ายาวเป็นท่อนสั้น: กันเสียงขาด + resume แม่นขึ้น ----
 function splitToChunks(text, max){
-  max = max || 180;
-  const out=[];
-  const parts = text.split(/(?<=[\.\!\?\u0E2F])\s+|(?<=\s)(?=\u0020{2,})/).filter(Boolean);
-  let buf="";
-  const push=s=>{ s=s.trim(); if(s) out.push(s); };
-  const flow = parts.length>1 ? parts : [text];
-  flow.forEach(seg=>{
-    if((buf+" "+seg).trim().length<=max){ buf=(buf?buf+" ":"")+seg; return; }
-    push(buf); buf="";
-    if(seg.length<=max){ buf=seg; return; }
-    let s=seg;
-    while(s.length>max){
-      let cut=s.lastIndexOf(" ",max); if(cut<max*0.5) cut=max;
-      push(s.slice(0,cut)); s=s.slice(cut).trim();
-    }
-    buf=s;
-  });
-  push(buf);
+  max = max || 300;                        // ท่อนยาวขึ้น = ช่องเงียบระหว่างท่อนน้อยลง
+  text = (text||"").trim();
+  if(text.length<=max) return [text];      // ย่อหน้าส่วนใหญ่: อ่านรวดเดียว ไม่ซอยเลย
+  const out=[]; let s=text;
+  while(s.length>max){
+    let cut = s.lastIndexOf(" ", max);     // ตัดที่ช่องว่าง (ไทยเว้นวรรคท้ายประโยค)
+    if(cut < max*0.4) cut = max;           // ไม่มีช่องว่าง -> ตัดตรงๆ
+    out.push(s.slice(0,cut).trim());
+    s = s.slice(cut).trim();
+  }
+  if(s) out.push(s);
   return out.length?out:[text];
 }
 function buildChunks(){
@@ -303,8 +303,10 @@ function speakNext(){
   u.onstart = ()=>{
     const p=document.getElementById("ttsPos");
     if(p) p.textContent = `กำลังอ่าน ${ttsIdx+1}/${ttsChunks.length}`;
-    clearHighlight(); el.classList.add("speaking");
-    el.scrollIntoView({block:"center", behavior:"smooth"});
+    if(!el.classList.contains("speaking")){      // ย่อหน้าใหม่เท่านั้นถึง scroll
+      clearHighlight(); el.classList.add("speaking");
+      el.scrollIntoView({block:"center", behavior:"smooth"});
+    }
     savePos();
   };
   u.onend = ()=>{ if(!ttsActive||ttsPaused) return; ttsIdx++; savePos(); speakNext(); };
