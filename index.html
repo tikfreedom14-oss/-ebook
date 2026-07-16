@@ -292,26 +292,60 @@ function loadPos(){
   try{ return JSON.parse(localStorage.getItem(TTS_POS)||"null"); }catch(e){ return null; }
 }
 
+// watchdog config: Android บางเครื่องไม่ยิง onend -> ระบบต้องเดินต่อเอง
+const TTS_START_BUDGET = 6000;   // ms รอเสียง "เริ่ม" (ไม่เริ่ม = engine ค้าง)
+const TTS_MS_PER_CHAR  = 130;    // งบอ่านต่อตัวอักษร (เผื่อเหลือมาก)
+const TTS_BASE_BUDGET  = 4000;
+let ttsGen = 0;                  // token กันสั่งซ้ำ/ชนกัน
+let ttsRetry = 0;
+const ttsUtterRefs = [];         // กัน GC เก็บ utterance ทิ้ง (บั๊ก Android)
+
 function speakNext(){
   if(!ttsActive) return;
   if(ttsIdx >= ttsChunks.length){ nextChapterOrStop(); return; }
+  const my = ++ttsGen;
   const {el, txt} = ttsChunks[ttsIdx];
   const u = new SpeechSynthesisUtterance(txt);
   u.lang="th-TH";
   const v=pickThaiVoice(); if(v) u.voice=v;
   u.rate=0.98; u.pitch=1.0;
+  let started=false, wd=null;
+  const clearWd=()=>{ if(wd){ clearTimeout(wd); wd=null; } };
+  const advance=()=>{                 // เดินหน้าท่อนถัดไป (ทางเดียวเท่านั้น)
+    if(my!==ttsGen) return;           // มีคำสั่งใหม่กว่าแล้ว -> เมิน
+    clearWd();
+    if(!ttsActive||ttsPaused) return;
+    ttsIdx++; savePos(); ttsRetry=0; speakNext();
+  };
   u.onstart = ()=>{
+    if(my!==ttsGen) return;
+    started=true; ttsRetry=0;
+    clearWd();                        // ชั้น 2: เฝ้าระหว่างอ่าน (กัน onend หาย)
+    wd=setTimeout(()=>{
+      if(my!==ttsGen||ttsPaused||!ttsActive) return;
+      try{ synth.cancel(); }catch(e){}
+      advance();                      // เงียบเกินงบ = onend หาย -> ไปต่อเอง
+    }, TTS_BASE_BUDGET + txt.length*TTS_MS_PER_CHAR);
     const p=document.getElementById("ttsPos");
     if(p) p.textContent = `กำลังอ่าน ${ttsIdx+1}/${ttsChunks.length}`;
-    if(!el.classList.contains("speaking")){      // ย่อหน้าใหม่เท่านั้นถึง scroll
+    if(!el.classList.contains("speaking")){
       clearHighlight(); el.classList.add("speaking");
       el.scrollIntoView({block:"center", behavior:"smooth"});
     }
     savePos();
   };
-  u.onend = ()=>{ if(!ttsActive||ttsPaused) return; ttsIdx++; savePos(); speakNext(); };
-  u.onerror = ()=>{ if(!ttsActive||ttsPaused) return; ttsIdx++; speakNext(); };
+  u.onend  = advance;
+  u.onerror= advance;
+  // ชั้น 1: เฝ้าว่าเสียง "เริ่ม" จริงไหม (Android engine ค้างบ่อยตรงนี้)
+  wd=setTimeout(()=>{
+    if(my!==ttsGen||started||ttsPaused||!ttsActive) return;
+    try{ synth.cancel(); }catch(e){}
+    if(ttsRetry<2){ ttsRetry++; ttsGen++; speakNext(); }   // ลองท่อนเดิมใหม่
+    else { ttsRetry=0; advance(); }                        // ค้างซ้ำ -> ข้ามท่อน
+  }, TTS_START_BUDGET);
   ttsCurUtter = u;
+  ttsUtterRefs.push(u); if(ttsUtterRefs.length>4) ttsUtterRefs.shift();
+  try{ if(synth.speaking||synth.pending) synth.cancel(); }catch(e){}  // แก้คิวค้าง Android
   synth.speak(u);
 }
 
@@ -335,6 +369,7 @@ function nextChapterOrStop(){
 }
 
 function stopTTS(finished){
+  ttsGen++;                            // ฆ่า watchdog ที่ค้างอยู่ทั้งหมด
   if(synth) synth.cancel();
   ttsActive=false; ttsPaused=false; ttsCurUtter=null;
   stopKeepAlive(); releaseWakeLock();
@@ -497,14 +532,14 @@ document.getElementById("ttsToggle").onclick = ()=>{
     ttsPaused=false; setToggleIcon(true);
     if("mediaSession" in navigator) navigator.mediaSession.playbackState="playing";
     requestWakeLock(); startKeepAlive();
-    if(synth.paused && synth.speaking){ synth.resume(); }
-    else { synth.cancel(); speakNext(); }             // resume ไม่ติด -> อ่านท่อนเดิมใหม่
+    synth.cancel(); speakNext();                      // อ่านต่อจากท่อนที่ค้าง (ttsIdx เดิม)
   } else {                                            // ⏸ หยุดชั่วคราว
-    ttsPaused=true; setToggleIcon(false);
+    ttsPaused=true; ttsGen++;          // หยุด + ฆ่า watchdog
+    setToggleIcon(false);
     if("mediaSession" in navigator) navigator.mediaSession.playbackState="paused";
     stopKeepAlive(); releaseWakeLock();
     savePos();
-    try{ synth.pause(); }catch(e){ synth.cancel(); }
+    try{ synth.cancel(); }catch(e){}   // มือถือ pause() ไม่เวิร์ก -> cancel ไปเลย (resume จากตำแหน่งที่จำไว้)
   }
 };
 document.getElementById("ttsStop").onclick = ()=>stopTTS(true);
