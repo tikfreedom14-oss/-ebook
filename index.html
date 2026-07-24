@@ -729,6 +729,7 @@ function showCover(){
   const bn=document.getElementById("backNav"); if(bn) bn.classList.remove("active");
   window.scrollTo(0,0);
   try{localStorage.setItem("ebook_last","cover")}catch(e){}
+  countView("cover","ปกหนังสือ");
 }
 
 function showBack(){
@@ -764,6 +765,7 @@ function showBack(){
   const bn=document.getElementById("backNav"); if(bn) bn.classList.add("active");
   window.scrollTo(0,0);
   try{localStorage.setItem("ebook_last","back")}catch(e){}
+  countView("back","ปกหลัง");
 }
 
 let current = null;   // บทที่กำลังเปิดอยู่ (TTS ใช้อ้างอิง)
@@ -810,6 +812,7 @@ function render(num){
   document.querySelectorAll(".ch").forEach(c=>c.classList.toggle("active",+c.dataset.num===num));
   window.scrollTo(0,0);
   try{localStorage.setItem("ebook_last",String(num))}catch(e){}
+  countView("ch/"+num, (num===0||num===0.5?meta.title:"บทที่ "+num+" · "+meta.title));
 }
 function go(num){
   const meta = flat.find(f=>f.num===num);
@@ -817,6 +820,28 @@ function go(num){
   render(num);
 }
 
+
+
+// ---------- นับยอดผู้อ่าน (GoatCounter) ----------
+// วิธีเปิดใช้: สมัครฟรีที่ goatcounter.com แล้วใส่ code ของคุณในบรรทัดล่างนี้
+// เช่น ถ้าได้ลิงก์ tik14.goatcounter.com ให้ใส่ "tik14"
+// ปล่อยว่างไว้ = ไม่มีการนับ และไม่มีการเรียกไฟล์จากภายนอกเลย
+const GC_CODE = "tik14";
+
+if(GC_CODE){
+  window.goatcounter = { no_onload:true };   // นับเองตอนเปลี่ยนบท
+  const gc = document.createElement("script");
+  gc.async = true;
+  gc.src = "https://gc.zgo.at/count.js";
+  gc.setAttribute("data-goatcounter", `https://${GC_CODE}.goatcounter.com/count`);
+  document.head.appendChild(gc);
+}
+function countView(path, title){
+  try{
+    if(!GC_CODE || !window.goatcounter || typeof window.goatcounter.count !== "function") return;
+    window.goatcounter.count({ path:path, title:title });
+  }catch(e){}
+}
 
 // ---------- build whole-book document for print / PDF ----------
 function buildPrintDoc(){
@@ -887,7 +912,7 @@ function buildPrintDoc(){
   box.dataset.built = "1";
 }
 window.addEventListener("beforeprint", buildPrintDoc);
-document.getElementById("printBtn").onclick = ()=>{ stopTTS(); buildPrintDoc(); setTimeout(()=>window.print(), 120); };
+document.getElementById("printBtn").onclick = ()=>{ stopTTS(); countView("action/print-pdf","กดพิมพ์ / PDF"); buildPrintDoc(); setTimeout(()=>window.print(), 120); };
 
 // font size
 let fs = 19;
